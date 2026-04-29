@@ -8,15 +8,17 @@ import re
 import os
 import json
 
+print("🔧 Starting Purginator Bot...")
+
 # ──────────────────────────────────────────────
 #  CONFIG
 # ──────────────────────────────────────────────
-ACTIVITY_FILE = "activity_data.json"   # persists last-seen timestamps
-PAGE_SIZE = 15                          # members shown per confirmation page
-KICK_BAN_DELAY = 1.0                    # seconds between each kick/ban (rate-limit safety)
+ACTIVITY_FILE = "activity_data.json"
+PAGE_SIZE = 15
+KICK_BAN_DELAY = 1.0
 
 # ──────────────────────────────────────────────
-#  FLASK KEEP-ALIVE (for Render / UptimeRobot)
+#  FLASK KEEP-ALIVE
 # ──────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -25,7 +27,8 @@ def home():
     return "Purginator Bot is alive!"
 
 def run():
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     t = Thread(target=run)
@@ -39,13 +42,12 @@ intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 intents.guilds = True
-intents.presences = True  # needed for online/offline status tracking
+intents.presences = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command("help")
 
-# In-memory activity cache: { "guild_id:user_id": "ISO timestamp" }
-activity_data: dict[str, str] = {}
+activity_data = {}
 
 
 # ──────────────────────────────────────────────
@@ -69,14 +71,12 @@ def save_activity():
         pass
 
 
-def record_activity(guild_id: int, user_id: int):
-    """Record the current UTC time as last activity for a member."""
+def record_activity(guild_id, user_id):
     key = f"{guild_id}:{user_id}"
     activity_data[key] = datetime.now(timezone.utc).isoformat()
 
 
-def get_last_active(guild_id: int, user_id: int) -> datetime | None:
-    """Return the last-active datetime (UTC) or None if never recorded."""
+def get_last_active(guild_id, user_id):
     key = f"{guild_id}:{user_id}"
     ts = activity_data.get(key)
     if ts:
@@ -85,7 +85,7 @@ def get_last_active(guild_id: int, user_id: int) -> datetime | None:
 
 
 # ──────────────────────────────────────────────
-#  EVENTS — track activity
+#  EVENTS
 # ──────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -94,7 +94,7 @@ async def on_ready():
 
 
 @bot.event
-async def on_message(message: discord.Message):
+async def on_message(message):
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
@@ -103,21 +103,20 @@ async def on_message(message: discord.Message):
 
 
 @bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+async def on_reaction_add(reaction, user):
     if user.bot or not reaction.message.guild:
         return
     record_activity(reaction.message.guild.id, user.id)
 
 
 @bot.event
-async def on_voice_state_update(member: discord.Member, before, after):
+async def on_voice_state_update(member, before, after):
     if member.bot:
         return
     if after.channel is not None:
         record_activity(member.guild.id, member.id)
 
 
-# Periodically save activity data to disk (every 5 min)
 @bot.event
 async def on_connect():
     bot.loop.create_task(_auto_save_loop())
@@ -131,20 +130,19 @@ async def _auto_save_loop():
 
 
 # ──────────────────────────────────────────────
-#  ARGUMENT PARSER (shared by masskick & massban)
+#  ARGUMENT PARSER
 # ──────────────────────────────────────────────
 class ParsedArgs:
     def __init__(self):
-        self.role: discord.Role | None = None
-        self.date_filter: datetime | None = None
-        self.date_type: str | None = None
-        self.inactive_days: int | None = None
+        self.role = None
+        self.date_filter = None
+        self.date_type = None
+        self.inactive_days = None
 
 
-def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | None, str | None]:
+def parse_command_args(ctx, args):
     parsed = ParsedArgs()
 
-    # ── Role ──
     role_match = re.search(r"<@&(\d+)>", args)
     role_name_match = re.search(r"role:(\S+)", args, re.IGNORECASE)
 
@@ -160,7 +158,6 @@ def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | N
             "Example: `!masskick @Visitors before:2025-08-08`"
         )
 
-    # ── Date filter (optional) ──
     date_match = re.search(r"(before|after|on):(\S+)", args, re.IGNORECASE)
     if date_match:
         parsed.date_type = date_match.group(1).lower()
@@ -175,7 +172,6 @@ def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | N
         except ValueError:
             return None, f"❌ Invalid date `{date_str}`. Make sure the date actually exists."
 
-    # ── Inactive days (optional) ──
     inactive_match = re.search(r"inactive:(\d+)", args, re.IGNORECASE)
     if inactive_match:
         parsed.inactive_days = int(inactive_match.group(1))
@@ -196,7 +192,7 @@ def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | N
 # ──────────────────────────────────────────────
 #  MEMBER FILTERING
 # ──────────────────────────────────────────────
-def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Member]:
+def filter_members(guild, parsed):
     now = datetime.now(timezone.utc)
     results = []
 
@@ -234,18 +230,12 @@ def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Mem
 
 
 # ──────────────────────────────────────────────
-#  CONFIRMATION UI (shared)
+#  CONFIRMATION UI
 # ──────────────────────────────────────────────
-async def confirm_action(
-    ctx: commands.Context,
-    members: list[discord.Member],
-    action_word: str,
-    role: discord.Role,
-    parsed: ParsedArgs,
-) -> bool:
+async def confirm_action(ctx, members, action_word, role, parsed):
     now_utc = datetime.now(timezone.utc)
 
-    def format_member(m: discord.Member) -> str:
+    def format_member(m):
         joined = m.joined_at.date() if m.joined_at else "?"
         last = get_last_active(m.guild.id, m.id)
         if last:
@@ -260,7 +250,7 @@ async def confirm_action(
     total_pages = len(pages)
     current_page = 0
 
-    def build_embed(page_idx: int) -> discord.Embed:
+    def build_embed(page_idx):
         embed = discord.Embed(
             title=f"⚠️ Mass {action_word.title()} Confirmation",
             color=discord.Color.orange(),
@@ -278,7 +268,7 @@ async def confirm_action(
         if len(body) > 1000:
             body = body[:997] + "..."
         embed.add_field(name="Preview", value=f"```{body}```", inline=False)
-        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}  •  ◀️▶️ navigate  •  ✅ confirm  •  ❌ cancel")
+        embed.set_footer(text=f"Page {page_idx + 1}/{total_pages}  |  navigate  |  confirm  |  cancel")
         return embed
 
     msg = await ctx.send(embed=build_embed(current_page))
@@ -335,7 +325,7 @@ async def confirm_action(
 # ──────────────────────────────────────────────
 @bot.command(name="masskick")
 @commands.has_permissions(kick_members=True)
-async def masskick(ctx: commands.Context, *, args: str = None):
+async def masskick(ctx, *, args=None):
     if not args:
         await ctx.send(
             "**Usage:** `!masskick @Role [before:|after:|on:YYYY-MM-DD] [inactive:DAYS]`\n"
@@ -348,7 +338,7 @@ async def masskick(ctx: commands.Context, *, args: str = None):
         await ctx.send(error)
         return
 
-    await ctx.send("🔍 Scanning members… this may take a moment.")
+    await ctx.send("🔍 Scanning members... this may take a moment.")
     members = filter_members(ctx.guild, parsed)
 
     if not members:
@@ -364,7 +354,7 @@ async def masskick(ctx: commands.Context, *, args: str = None):
         return
 
     kicked, failed = 0, []
-    progress_msg = await ctx.send(f"⏳ Kicking 0/{len(members)}…")
+    progress_msg = await ctx.send(f"⏳ Kicking 0/{len(members)}...")
 
     for i, member in enumerate(members, 1):
         try:
@@ -377,7 +367,7 @@ async def masskick(ctx: commands.Context, *, args: str = None):
 
         if i % 10 == 0 or i == len(members):
             try:
-                await progress_msg.edit(content=f"⏳ Kicking {i}/{len(members)}…")
+                await progress_msg.edit(content=f"⏳ Kicking {i}/{len(members)}...")
             except Exception:
                 pass
 
@@ -391,7 +381,7 @@ async def masskick(ctx: commands.Context, *, args: str = None):
 # ──────────────────────────────────────────────
 @bot.command(name="massban")
 @commands.has_permissions(ban_members=True)
-async def massban(ctx: commands.Context, *, args: str = None):
+async def massban(ctx, *, args=None):
     if not args:
         await ctx.send(
             "**Usage:** `!massban @Role [before:|after:|on:YYYY-MM-DD] [inactive:DAYS]`\n"
@@ -404,7 +394,7 @@ async def massban(ctx: commands.Context, *, args: str = None):
         await ctx.send(error)
         return
 
-    await ctx.send("🔍 Scanning members… this may take a moment.")
+    await ctx.send("🔍 Scanning members... this may take a moment.")
     members = filter_members(ctx.guild, parsed)
 
     if not members:
@@ -420,7 +410,7 @@ async def massban(ctx: commands.Context, *, args: str = None):
         return
 
     banned, failed = 0, []
-    progress_msg = await ctx.send(f"⏳ Banning 0/{len(members)}…")
+    progress_msg = await ctx.send(f"⏳ Banning 0/{len(members)}...")
 
     for i, member in enumerate(members, 1):
         try:
@@ -436,7 +426,7 @@ async def massban(ctx: commands.Context, *, args: str = None):
 
         if i % 10 == 0 or i == len(members):
             try:
-                await progress_msg.edit(content=f"⏳ Banning {i}/{len(members)}…")
+                await progress_msg.edit(content=f"⏳ Banning {i}/{len(members)}...")
             except Exception:
                 pass
 
@@ -446,9 +436,9 @@ async def massban(ctx: commands.Context, *, args: str = None):
 
 
 # ──────────────────────────────────────────────
-#  RESULT EMBED (shared)
+#  RESULT EMBED
 # ──────────────────────────────────────────────
-async def _send_result_embed(ctx, action: str, success: int, total: int, failed: list[str]):
+async def _send_result_embed(ctx, action, success, total, failed):
     embed = discord.Embed(
         title=f"{'✅' if not failed else '⚠️'} Mass {action} Results",
         color=discord.Color.green() if not failed else discord.Color.orange(),
@@ -462,18 +452,18 @@ async def _send_result_embed(ctx, action: str, success: int, total: int, failed:
         max_show = 25
         text = "\n".join(failed[:max_show])
         if len(failed) > max_show:
-            text += f"\n…and {len(failed) - max_show} more"
+            text += f"\n...and {len(failed) - max_show} more"
         embed.add_field(name=f"Failed ({len(failed)})", value=f"```{text}```", inline=False)
 
     await ctx.send(embed=embed)
 
 
 # ──────────────────────────────────────────────
-#  !activity — check a single member's last seen
+#  !activity
 # ──────────────────────────────────────────────
 @bot.command(name="activity")
 @commands.has_permissions(kick_members=True)
-async def activity_cmd(ctx: commands.Context, member: discord.Member = None):
+async def activity_cmd(ctx, member: discord.Member = None):
     if not member:
         await ctx.send("**Usage:** `!activity @User` — shows their last recorded activity.")
         return
@@ -499,11 +489,11 @@ async def activity_cmd(ctx: commands.Context, member: discord.Member = None):
 
 
 # ──────────────────────────────────────────────
-#  !inactive — list inactive members of a role
+#  !inactive
 # ──────────────────────────────────────────────
 @bot.command(name="inactive")
 @commands.has_permissions(kick_members=True)
-async def inactive_cmd(ctx: commands.Context, *, args: str = None):
+async def inactive_cmd(ctx, *, args=None):
     if not args:
         await ctx.send(
             "**Usage:** `!inactive @Role DAYS`\n"
@@ -573,12 +563,11 @@ async def inactive_cmd(ctx: commands.Context, *, args: str = None):
 #  !help
 # ──────────────────────────────────────────────
 @bot.command(name="help")
-async def help_cmd(ctx: commands.Context):
+async def help_cmd(ctx):
     embed = discord.Embed(
         title="📜 Purginator Bot Commands",
         color=discord.Color.blue(),
     )
-
     embed.add_field(
         name="!masskick @Role [filters]",
         value=(
@@ -612,7 +601,6 @@ async def help_cmd(ctx: commands.Context):
         value="Check a specific member's last recorded activity and join date.",
         inline=False,
     )
-
     embed.set_footer(text="⚠️ All kick/ban actions require confirmation before executing.")
     await ctx.send(embed=embed)
 
@@ -621,7 +609,7 @@ async def help_cmd(ctx: commands.Context):
 #  ERROR HANDLING
 # ──────────────────────────────────────────────
 @bot.event
-async def on_command_error(ctx: commands.Context, error):
+async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("🔒 You don't have permission to use this command.")
     elif isinstance(error, commands.MemberNotFound):
@@ -636,14 +624,14 @@ async def on_command_error(ctx: commands.Context, error):
 # ──────────────────────────────────────────────
 #  RUN
 # ──────────────────────────────────────────────
-keep_alive()
-
+print("🔧 Checking for DISCORD_TOKEN...")
 token = os.environ.get("DISCORD_TOKEN")
 if not token:
     print("❌ ERROR: DISCORD_TOKEN environment variable is not set!")
-    print("Available env vars:", list(os.environ.keys()))
+    print("Available env vars:", [k for k in os.environ.keys() if not k.startswith("_")])
     exit(1)
 else:
-    print(f"✅ Token found ({len(token)} chars), attempting to connect...")
+    print(f"✅ Token found ({len(token)} chars), connecting to Discord...")
 
+keep_alive()
 bot.run(token)
