@@ -2,6 +2,8 @@ import discord
 from discord.ext import commands
 import asyncio
 from datetime import datetime, timedelta, timezone
+from flask import Flask
+from threading import Thread
 import re
 import os
 import json
@@ -13,19 +15,21 @@ ACTIVITY_FILE = "activity_data.json"   # persists last-seen timestamps
 PAGE_SIZE = 15                          # members shown per confirmation page
 KICK_BAN_DELAY = 1.0                    # seconds between each kick/ban (rate-limit safety)
 
-# === Flask keep_alive setup ===
-
+# ──────────────────────────────────────────────
+#  FLASK KEEP-ALIVE (for Render / UptimeRobot)
+# ──────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "I'm alive!"
+    return "Purginator Bot is alive!"
 
 def run():
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
 def keep_alive():
     t = Thread(target=run)
+    t.daemon = True
     t.start()
 
 # ──────────────────────────────────────────────
@@ -109,7 +113,7 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
 async def on_voice_state_update(member: discord.Member, before, after):
     if member.bot:
         return
-    if after.channel is not None:  # joined or moved to a voice channel
+    if after.channel is not None:
         record_activity(member.guild.id, member.id)
 
 
@@ -133,15 +137,11 @@ class ParsedArgs:
     def __init__(self):
         self.role: discord.Role | None = None
         self.date_filter: datetime | None = None
-        self.date_type: str | None = None          # "before", "after", "on"
-        self.inactive_days: int | None = None       # e.g. 30
+        self.date_type: str | None = None
+        self.inactive_days: int | None = None
 
 
 def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | None, str | None]:
-    """
-    Parse shared arguments for masskick / massban.
-    Returns (ParsedArgs, None) on success or (None, error_message) on failure.
-    """
     parsed = ParsedArgs()
 
     # ── Role ──
@@ -182,7 +182,6 @@ def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | N
         if parsed.inactive_days < 1:
             return None, "❌ `inactive:` value must be at least 1 day."
 
-    # Must have at least one filter beyond the role
     if parsed.date_filter is None and parsed.inactive_days is None:
         return None, (
             "❌ **Please provide at least one filter:**\n"
@@ -198,7 +197,6 @@ def parse_command_args(ctx: commands.Context, args: str) -> tuple[ParsedArgs | N
 #  MEMBER FILTERING
 # ──────────────────────────────────────────────
 def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Member]:
-    """Return members who match ALL provided filters."""
     now = datetime.now(timezone.utc)
     results = []
 
@@ -206,11 +204,10 @@ def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Mem
         if member.bot:
             continue
 
-        # ── Join-date filter ──
         if parsed.date_filter and parsed.date_type:
             joined = member.joined_at
             if not joined:
-                continue  # no join date on record — skip
+                continue
             joined_naive = joined.replace(tzinfo=None)
             if parsed.date_type == "before" and joined_naive >= parsed.date_filter:
                 continue
@@ -219,20 +216,17 @@ def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Mem
             if parsed.date_type == "on" and joined_naive.date() != parsed.date_filter.date():
                 continue
 
-        # ── Inactivity filter ──
         if parsed.inactive_days is not None:
             last_active = get_last_active(guild.id, member.id)
             if last_active is None:
-                # Never tracked — fall back to join date as "last seen"
                 last_active = member.joined_at
             if last_active is None:
                 continue
-            # Make sure we compare tz-aware datetimes
             if last_active.tzinfo is None:
                 last_active = last_active.replace(tzinfo=timezone.utc)
             days_since = (now - last_active).days
             if days_since < parsed.inactive_days:
-                continue  # still active within threshold — skip
+                continue
 
         results.append(member)
 
@@ -245,14 +239,10 @@ def filter_members(guild: discord.Guild, parsed: ParsedArgs) -> list[discord.Mem
 async def confirm_action(
     ctx: commands.Context,
     members: list[discord.Member],
-    action_word: str,          # "kick" or "ban"
+    action_word: str,
     role: discord.Role,
     parsed: ParsedArgs,
 ) -> bool:
-    """
-    Show paginated preview embed and wait for ✅ / ❌.
-    Returns True if confirmed, False otherwise.
-    """
     now_utc = datetime.now(timezone.utc)
 
     def format_member(m: discord.Member) -> str:
@@ -285,7 +275,6 @@ async def confirm_action(
             header += "\nFilters: " + " **AND** ".join(filters)
         embed.description = header
         body = "\n".join(pages[page_idx])
-        # Discord field value limit is 1024 chars
         if len(body) > 1000:
             body = body[:997] + "..."
         embed.add_field(name="Preview", value=f"```{body}```", inline=False)
@@ -370,12 +359,10 @@ async def masskick(ctx: commands.Context, *, args: str = None):
     if not confirmed:
         return
 
-    # Permission guard
     if not ctx.guild.me.guild_permissions.kick_members:
         await ctx.send("❌ I lack the **Kick Members** permission.")
         return
 
-    # Execute
     kicked, failed = 0, []
     progress_msg = await ctx.send(f"⏳ Kicking 0/{len(members)}…")
 
@@ -388,7 +375,6 @@ async def masskick(ctx: commands.Context, *, args: str = None):
         except Exception as e:
             failed.append(f"{member.display_name} — {type(e).__name__}")
 
-        # Update progress every 10 members
         if i % 10 == 0 or i == len(members):
             try:
                 await progress_msg.edit(content=f"⏳ Kicking {i}/{len(members)}…")
@@ -440,7 +426,7 @@ async def massban(ctx: commands.Context, *, args: str = None):
         try:
             await member.ban(
                 reason=f"Mass ban by {ctx.author} | Role: {parsed.role.name}",
-                delete_message_days=0,   # don't nuke their message history
+                delete_message_days=0,
             )
             banned += 1
         except discord.Forbidden:
@@ -525,7 +511,6 @@ async def inactive_cmd(ctx: commands.Context, *, args: str = None):
         )
         return
 
-    # Parse role
     role_match = re.search(r"<@&(\d+)>", args)
     role_name_match = re.search(r"role:(\S+)", args, re.IGNORECASE)
     role = None
@@ -539,7 +524,6 @@ async def inactive_cmd(ctx: commands.Context, *, args: str = None):
         await ctx.send("❌ Role not found. Mention a role or use `role:RoleName`.")
         return
 
-    # Parse days
     days_match = re.search(r"(\d+)", args.replace(str(role.id), ""))
     if not days_match:
         await ctx.send("❌ Please provide the number of days. Example: `!inactive @Role 30`")
@@ -591,7 +575,7 @@ async def inactive_cmd(ctx: commands.Context, *, args: str = None):
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(
-        title="📜 Bot Commands",
+        title="📜 Purginator Bot Commands",
         color=discord.Color.blue(),
     )
 
@@ -643,7 +627,7 @@ async def on_command_error(ctx: commands.Context, error):
     elif isinstance(error, commands.MemberNotFound):
         await ctx.send("❌ Member not found. Make sure you're mentioning a valid user.")
     elif isinstance(error, commands.CommandNotFound):
-        pass  # silently ignore unknown commands
+        pass
     else:
         await ctx.send(f"❌ An error occurred: `{error}`")
         raise error
@@ -652,5 +636,5 @@ async def on_command_error(ctx: commands.Context, error):
 # ──────────────────────────────────────────────
 #  RUN
 # ──────────────────────────────────────────────
+keep_alive()
 bot.run(os.environ["DISCORD_TOKEN"])
-set DISCORD_TOKEN=MTQ5ODU0MTI0NDAzMTQzNDg5NA.GDgn5C.fRk778q8VUpjvVmRRrRVxdUvdNf150oLLGiv8A
