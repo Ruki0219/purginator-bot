@@ -637,4 +637,4 @@ async def on_command_error(ctx: commands.Context, error):
 #  RUN
 # ──────────────────────────────────────────────
 keep_alive()
-bot.run(os.environ["DISCORD_TOKEN"])
+bot.run(os.environ[DISCORD_TOKEN])
