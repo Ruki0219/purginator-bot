@@ -637,4 +637,13 @@ async def on_command_error(ctx: commands.Context, error):
 #  RUN
 # ──────────────────────────────────────────────
 keep_alive()
-bot.run(os.environ[DISCORD_TOKEN])
+
+token = os.environ.get("DISCORD_TOKEN")
+if not token:
+    print("❌ ERROR: DISCORD_TOKEN environment variable is not set!")
+    print("Available env vars:", list(os.environ.keys()))
+    exit(1)
+else:
+    print(f"✅ Token found ({len(token)} chars), attempting to connect...")
+
+bot.run(token)
